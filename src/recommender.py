@@ -1,14 +1,9 @@
-from __future__ import annotations
+#vector_path = "/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_vectors.npy",
+#title_path = "/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_filenames.npy",
+#metadata_path = "/home/ivan/PycharmProjects/MPr/audio_samples/fma_metadata/tracks.csv",
+#co_path = "/home/ivan/PycharmProjects/MPr/embeddings/co_matrix.npy",
 
-"""src/recommender.py  –  CLAP + Collaborative hybrid recommender
-
-• uses pre‑computed CLAP audio vectors (audio_vectors.npy)
-• looks up readable titles from FMA metadata (tracks.csv)
-• optionally blends a co‑occurrence matrix saved by 03_build_co_matrix.ipynb
-• supports genre‑aware querying and a tiny MMR diversity step
-"""
-
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import os
 import re
 
@@ -18,139 +13,150 @@ import faiss
 import torch
 from transformers import ClapProcessor, ClapModel
 
+_RE_ARTIST = re.compile(r"artist\s+\"([^\"]+)\"", re.I)
+_RE_SONG = re.compile(r"song\s+\"([^\"]+)\"", re.I)
+_RE_GENRE = re.compile(r"genre\s+\"([^\"]+)\"", re.I)
+
 
 class SimpleRecommender:
-    """Lightweight, in‑memory recommender.
+    def __init__(self,
+                 vector_path="/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_vectors.npy",
+                 title_path="/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_filenames.npy",
+                 metadata_path="/home/ivan/PycharmProjects/MPr/audio_samples/fma_metadata/tracks.csv",
+                 co_path="/home/ivan/PycharmProjects/MPr/embeddings/co_matrix.npy",
+                 alpha=0.7):
 
-    Parameters
-    ----------
-    vector_path   : path to ``audio_vectors.npy`` (shape ≈ N×512)
-    title_path    : path to ``audio_filenames.npy`` (N filenames)
-    metadata_path : FMA ``tracks.csv`` for artist / title / genre lookup
-    co_path       : optional ``co_matrix.npy`` – collaborative similarity
-    """
+        self.embeddings = np.load(vector_path)
+        assert self.embeddings.ndim == 2 and self.embeddings.dtype != object
+        self.embeddings = self.embeddings.astype("float32")
+        self.filepaths = np.load(title_path)
+        self.n, self.dim = self.embeddings.shape
 
-    def __init__(
-        self,
-        vector_path  = "/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_vectors.npy",
-        title_path   = "/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_filenames.npy",
-        metadata_path= "/home/ivan/PycharmProjects/MPr/audio_samples/fma_metadata/tracks.csv",
-        co_path      = "/home/ivan/PycharmProjects/MPr/embeddings/co_matrix.npy",
-        alpha: float = 0.7,                    # blend weight content vs collaborative
-    ) -> None:
-        # ── load content embeddings ────────────────────────────────
-        self.embeddings: np.ndarray = np.load(vector_path).astype("float32")
-        self.filepaths: np.ndarray = np.load(title_path)
-        self.dim = self.embeddings.shape[1]
-        self.n = self.embeddings.shape[0]
-
-        # ── load metadata (artist / title / genre) ────────────────
         self.metadata = pd.read_csv(metadata_path, index_col=0, header=[0, 1])
-        self.titles  = [self._filename_to_title(p) for p in self.filepaths]
-        self.genres  = [self._filename_to_genre(p) for p in self.filepaths]
+        self.titles = [self._id_to_title(p) for p in self.filepaths]
+        self.genres = [self._id_to_genre(p) for p in self.filepaths]
 
-        # ── load optional co‑occurrence matrix ────────────────────
-        self.co_matrix: Optional[np.ndarray]
+        self.co_matrix: Optional[np.ndarray] = None
         if co_path and os.path.exists(co_path):
-            self.co_matrix = np.load(co_path).astype("float32")
-            if self.co_matrix.shape[0] != self.n:
-                print("[WARN] co_matrix size mismatch – ignoring collaborative part")
-                self.co_matrix = None
-        else:
-            self.co_matrix = None
-        self.alpha = alpha  # blend weight
+            cm = np.load(co_path)
+            if cm.shape == (self.n, self.n):
+                self.co_matrix = cm.astype("float32")
+        self.alpha = alpha
 
-        # ── init CLAP text encoder ────────────────────────────────
         self.processor = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
-        self.model     = ClapModel.from_pretrained("laion/clap-htsat-unfused").to(
+        self.model = ClapModel.from_pretrained("laion/clap-htsat-unfused").to(
             "cuda" if torch.cuda.is_available() else "cpu")
 
-        # ── build FAISS index (cosine) ─────────────────────────────
         faiss.normalize_L2(self.embeddings)
         self.index = faiss.IndexFlatIP(self.dim)
         self.index.add(self.embeddings)
 
-    # ──────────────────────────────────────────────────────────────
-    # helpers
-    # ──────────────────────────────────────────────────────────────
-    def _filename_to_title(self, path: str) -> str:
-        tid = int(os.path.basename(path).split(".")[0])
+    def _id_from_path(self, path: str) -> int:
+        return int(os.path.basename(path).split(".")[0])
+
+    def _id_to_title(self, path: str) -> str:
+        tid = self._id_from_path(path)
         try:
             artist = self.metadata.loc[tid, ("artist", "name")]
-            title  = self.metadata.loc[tid, ("track", "title")]
+            title = self.metadata.loc[tid, ("track", "title")]
             return f"{artist} – {title}"
         except Exception:
             return os.path.basename(path)
 
-    def _filename_to_genre(self, path: str) -> Optional[str]:
-        tid = int(os.path.basename(path).split(".")[0])
+    def _id_to_genre(self, path: str) -> Optional[str]:
+        tid = self._id_from_path(path)
         try:
             return self.metadata.loc[tid, ("track", "genre_top")]
         except Exception:
             return None
 
-    def _embed_text(self, text: str) -> np.ndarray:
-        inputs = self.processor(text=text, return_tensors="pt").to(self.model.device)
+    def _embed_text(self, prompt: str) -> np.ndarray:
+        inp = self.processor(text=prompt, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
-            vec = self.model.get_text_features(**inputs)
+            vec = self.model.get_text_features(**inp)
         vec = vec.cpu().numpy().astype("float32")
         faiss.normalize_L2(vec)
         return vec
 
-    # ──────────────────────────────────────────────────────────────
-    # public API
-    # ──────────────────────────────────────────────────────────────
-    def recommend(self, query: str, genre: Optional[str] = None, k: int = 5) -> List[str]:
-        """Return *k* track titles similar to *query* (optionally constrained to *genre*)."""
+    def recommend(self, prompt_parts: Tuple[str, str | None, str | None], k: int = 10) -> List[str]:
+        seed, artist, genre = prompt_parts
 
-        # 1️⃣ embed query (prompt‑inject genre soft hint)
-        full_query = f"{query} in the genre {genre}" if genre else query
-        q_vec = self._embed_text(full_query)
+        anchor = f"{seed or ''} by {artist or ''} in the genre {genre or ''}".strip()
+        q_vec = self._embed_text(anchor)
 
-        # 2️⃣ initial FAISS search (top‑50)
-        _, idx = self.index.search(q_vec, 50)
-        idx = idx[0].tolist()
+        _, idx_all = self.index.search(q_vec, 100)
+        idx_all = idx_all[0].tolist()
 
-        # 3️⃣ hard genre filter (if requested)
         if genre:
-            idx = [i for i in idx if self.genres[i] and genre.lower() in self.genres[i].lower()]
-            if not idx:
-                idx = self.index.search(q_vec, k)[1][0].tolist()  # fallback to content only
+            idx_all = [i for i in idx_all if self.genres[i] and genre.lower() in self.genres[i].lower()]
+            if not idx_all:
+                idx_all = self.index.search(q_vec, 100)[1][0].tolist()
 
-        # 4️⃣ blend with collaborative score if available
-        if self.co_matrix is not None:
-            content_score = np.dot(self.embeddings[idx], q_vec.T).flatten()  # already normalized
-            cf_score      = self.co_matrix[idx][:, idx].max(axis=1)          # best co‑occurrence per candidate
-            final_score   = self.alpha*content_score + (1-self.alpha)*cf_score
-            idx           = [idx[i] for i in np.argsort(final_score)[::-1]]
+        seed_norm = f"{artist or ''} – {seed}".lower() if artist else seed.lower()
+        idx_all = [i for i in idx_all if seed_norm not in self.titles[i].lower()]
 
-        # 5️⃣ simple diversity via cosine‑based MMR
-        picked = []
-        for cand in idx:
-            if len(picked) == 0:
-                picked.append(cand)
-                continue
-            sim_to_set = max(np.dot(self.embeddings[cand], self.embeddings[p]) for p in picked)
-            if sim_to_set < 0.85:  # threshold
-                picked.append(cand)
-            if len(picked) == k:
+        seed_idx = None
+        if self.co_matrix is not None and artist:
+            try:
+                seed_idx = next(i for i, t in enumerate(self.titles) if artist.lower() in t.lower())
+            except StopIteration:
+                seed_idx = None
+
+        seen = set()
+        content_only, blended = [], []
+
+        for i in idx_all:
+            if len(content_only) >= k // 2:
                 break
-        if len(picked) < k:
-            picked.extend(idx[: k - len(picked)])
+            if i not in seen:
+                content_only.append(i)
+                seen.add(i)
 
-        return [self.titles[i] for i in picked[:k]]
+        if seed_idx is not None and self.co_matrix is not None:
+            scores = self.alpha * np.dot(self.embeddings[idx_all], q_vec.T).flatten()
+            scores += (1 - self.alpha) * self.co_matrix[seed_idx][idx_all]
+            sorted_idx = np.argsort(scores)[::-1]
+            for si in sorted_idx:
+                idx = idx_all[si]
+                if idx not in seen:
+                    blended.append(idx)
+                    seen.add(idx)
+                if len(blended) >= k // 2:
+                    break
 
+        # Fallback: if less than k from blended+content, fill with any unseen
+        extra = [i for i in idx_all if i not in seen]
+        while len(content_only) < k // 2 and extra:
+            content_only.append(extra.pop(0))
+        while len(blended) < k // 2 and extra:
+            blended.append(extra.pop(0))
 
-# single global instance ------------------------------------------------------
+        final = (
+                [f"{self.titles[i]}  [from: content-only]" for i in content_only] +
+                [f"{self.titles[i]}  [from: blended (02+03)]" for i in blended]
+        )
+        return final[:k]
+
+# Create model once globally
 _model = SimpleRecommender()
 
+def _parse_message(msg: str) -> Tuple[str, str | None, str | None]:
+    artist = _RE_ARTIST.search(msg)
+    song = _RE_SONG.search(msg)
+    genre = _RE_GENRE.search(msg)
+
+    cleaned = _RE_ARTIST.sub("", msg)
+    cleaned = _RE_SONG.sub("", cleaned)
+    cleaned = _RE_GENRE.sub("", cleaned)
+    cleaned = cleaned.replace("Recommend me a track", "").strip(" ,.")
+
+    return (
+        song.group(1) if song else cleaned,
+        artist.group(1) if artist else None,
+        genre.group(1) if genre else None
+    )
 
 def chat_wrapper(message: str, history=None) -> str:
-    """Gradio‑style callable: (message, history) → str list."""
-    # extract optional  "in the genre X" phrase
-    genre_match = re.search(r"genre ['\"]?([^'\"]+)['\"]?", message, flags=re.I)
-    genre = genre_match.group(1) if genre_match else None
-    cleaned = re.sub(r"genre ['\"]?([^'\"]+)['\"]?", "", message, flags=re.I).strip()
-
-    recs = _model.recommend(cleaned, genre=genre, k=5)
+    seed, artist, genre = _parse_message(message)
+    recs = _model.recommend((seed, artist, genre), k=10)
     return "\n".join(f"• {t}" for t in recs)
