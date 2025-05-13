@@ -1,8 +1,3 @@
-#vector_path = "/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_vectors.npy",
-#title_path = "/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_filenames.npy",
-#metadata_path = "/home/ivan/PycharmProjects/MPr/audio_samples/fma_metadata/tracks.csv",
-#co_path = "/home/ivan/PycharmProjects/MPr/embeddings/co_matrix.npy",
-
 from typing import List, Optional, Tuple
 import os
 import re
@@ -20,10 +15,10 @@ _RE_GENRE = re.compile(r"genre\s+\"([^\"]+)\"", re.I)
 
 class SimpleRecommender:
     def __init__(self,
-                 vector_path="/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_vectors.npy",
-                 title_path="/home/ivan/PycharmProjects/MPr/notebooks/embeddings/audio_filenames.npy",
+                 vector_path="/home/ivan/PycharmProjects/MPr/notebooks/embeddings/embedings_large/audio_vectors.npy",
+                 title_path="/home/ivan/PycharmProjects/MPr/notebooks/embeddings/embedings_large/audio_filenames.npy",
                  metadata_path="/home/ivan/PycharmProjects/MPr/audio_samples/fma_metadata/tracks.csv",
-                 co_path="/home/ivan/PycharmProjects/MPr/embeddings/co_matrix.npy",
+                 co_path="/home/ivan/PycharmProjects/MPr/notebooks/embeddings/embedings_large/co_matrix.npy",
                  alpha=0.7):
 
         self.embeddings = np.load(vector_path)
@@ -34,7 +29,15 @@ class SimpleRecommender:
 
         self.metadata = pd.read_csv(metadata_path, index_col=0, header=[0, 1])
         self.titles = [self._id_to_title(p) for p in self.filepaths]
-        self.genres = [self._id_to_genre(p) for p in self.filepaths]
+
+        # Genre sanitation: None instead of NaN, force strings
+        self.genres = []
+        for p in self.filepaths:
+            genre = self._id_to_genre(p)
+            if pd.isna(genre):
+                self.genres.append(None)
+            else:
+                self.genres.append(str(genre))
 
         self.co_matrix: Optional[np.ndarray] = None
         if co_path and os.path.exists(co_path):
@@ -87,8 +90,12 @@ class SimpleRecommender:
         _, idx_all = self.index.search(q_vec, 100)
         idx_all = idx_all[0].tolist()
 
+        # Safe genre filtering
         if genre:
-            idx_all = [i for i in idx_all if self.genres[i] and genre.lower() in self.genres[i].lower()]
+            idx_all = [
+                i for i in idx_all
+                if isinstance(self.genres[i], str) and genre.lower() in self.genres[i].lower()
+            ]
             if not idx_all:
                 idx_all = self.index.search(q_vec, 100)[1][0].tolist()
 
@@ -124,7 +131,6 @@ class SimpleRecommender:
                 if len(blended) >= k // 2:
                     break
 
-        # Fallback: if less than k from blended+content, fill with any unseen
         extra = [i for i in idx_all if i not in seen]
         while len(content_only) < k // 2 and extra:
             content_only.append(extra.pop(0))
@@ -132,12 +138,12 @@ class SimpleRecommender:
             blended.append(extra.pop(0))
 
         final = (
-                [f"{self.titles[i]}  [from: content-only]" for i in content_only] +
-                [f"{self.titles[i]}  [from: blended (02+03)]" for i in blended]
+            [f"{self.titles[i]}  [from: content-only]" for i in content_only] +
+            [f"{self.titles[i]}  [from: blended (02+03)]" for i in blended]
         )
         return final[:k]
 
-# Create model once globally
+# Global model instance
 _model = SimpleRecommender()
 
 def _parse_message(msg: str) -> Tuple[str, str | None, str | None]:
